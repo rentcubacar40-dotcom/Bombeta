@@ -1,0 +1,5 @@
+# Telegram Bot 2026
+python-telegram-bot==21.7  # Versión 2026
+telethon==1.35.0           # Para archivos grandes
+aiohttp==3.9.5            # Servidor web + descargas async
+python-dotenv==1.0.1      # Variables de entorno
