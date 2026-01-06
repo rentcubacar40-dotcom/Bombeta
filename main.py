@@ -2,17 +2,13 @@ import os
 import re
 import asyncio
 import logging
-from typing import Dict, Set
+from typing import Dict, Set, Tuple, Optional
 from datetime import datetime
-from aiohttp import web
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from aiohttp import web, ClientSession, ClientTimeout, ClientError
+from telethon import TelegramClient
 import hashlib
-import signal
-
-# Pyrogram imports
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message
-from pyrogram.enums import ParseMode
-from pyrogram.errors import BadRequest, FloodWait
 
 # Configurar logging
 logging.basicConfig(
@@ -24,14 +20,15 @@ logger = logging.getLogger(__name__)
 # Variables de entorno
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID', 0))
-API_ID = int(os.getenv('API_ID', 0))
-API_HASH = os.getenv('API_HASH', '')
+API_ID = os.getenv('API_ID')
+API_HASH = os.getenv('API_HASH')
 PORT = int(os.getenv('PORT', 10000))
-RENDER = os.getenv('RENDER', 'false').lower() == 'true'
 
 # Validar variables críticas
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN no configurado")
+    raise ValueError("BOT_TOKEN no configurado")
+if not API_ID or not API_HASH:
+    logger.warning("API_ID o API_HASH no configurados. Descargas limitadas a 50MB")
 
 # Almacenamiento en memoria
 authorized_users: Set[int] = set()
@@ -44,463 +41,485 @@ user_sessions: Dict[int, Dict] = {}  # Almacena URLs pendientes por usuario
 # URL base fija
 FIXED_DOWNLOAD_ID = "d794ab9e-2e58-4ac9-97da-237b86d1a6c3"
 
-# Variable global para la aplicación Pyrogram
-app = None
-web_runner = None
+# Variable global para la aplicación
+telegram_app = None
+telethon_client = None
 
-# ========== INICIALIZACIÓN PYROGRAM ==========
-async def init_pyrogram():
-    """Inicializa cliente Pyrogram"""
-    global app
+# ========== INICIALIZACIÓN TELETHON (para archivos grandes) ==========
+async def init_telethon():
+    """Inicializa cliente Telethon para archivos grandes"""
+    global telethon_client
     
-    try:
-        app = Client(
-            "apk_bot",
-            api_id=API_ID if API_ID else None,
-            api_hash=API_HASH if API_HASH else None,
-            bot_token=BOT_TOKEN,
-            parse_mode=ParseMode.MARKDOWN,
-            max_concurrent_transmissions=3,
-            sleep_threshold=60
-        )
-        
-        # Registrar handlers
-        register_handlers(app)
-        
-        await app.start()
-        bot_info = await app.get_me()
-        logger.info(f"✅ Bot iniciado: @{bot_info.username}")
-        
-    except Exception as e:
-        logger.error(f"❌ Error iniciando Pyrogram: {e}")
-        raise
-
-# ========== REGISTRO DE HANDLERS ==========
-def register_handlers(client: Client):
-    """Registra todos los handlers del bot"""
-    
-    @client.on_message(filters.command("start"))
-    async def start_handler(_, message: Message):
-        user_id = message.from_user.id
-        
-        if user_id in authorized_users:
-            welcome_msg = (
-                "🤖 *Bot de APKs APKLis 2026*\n\n"
-                "📲 *Cómo usar:*\n"
-                "1. Envía enlace APKLis.cu\n"
-                "2. Envía número de versión\n"
-                "3. Recibe el APK\n\n"
-                "⚡ *Soporta archivos hasta 2GB*\n"
-                "🛡 *Cifrado de extremo a extremo*\n\n"
-                "🛠 *Comandos Admin:*\n"
-                "• /add id1 id2 - Añadir usuarios\n"
-                "• /remove id - Eliminar usuario\n"
-                "• /users - Listar usuarios\n"
-                "• /status - Estado del bot\n"
-                "• /clean - Limpiar caché"
-            )
-            await message.reply_text(welcome_msg)
-        else:
-            await message.reply_text(
-                "🔒 *Acceso restringido*\n\n"
-                "Contacta al administrador para acceder."
-            )
-    
-    @client.on_message(filters.command("status"))
-    async def status_handler(_, message: Message):
-        user_id = message.from_user.id
-        if user_id not in authorized_users:
-            return
-        
-        status_msg = (
-            f"📊 *Estado del Bot - {datetime.now().year}*\n\n"
-            f"✅ Bot: Operativo\n"
-            f"👥 Usuarios autorizados: {len(authorized_users)}\n"
-            f"⏬ Descargas activas: {len(processing_users)}\n"
-            f"📦 Sesiones en memoria: {len(user_sessions)}\n"
-            f"🔧 API ID/HASH: {'✅' if API_ID and API_HASH else '❌'}\n"
-            f"🌍 Render: {'✅' if RENDER else '❌'}"
-        )
-        await message.reply_text(status_msg)
-    
-    @client.on_message(filters.command("add"))
-    async def add_handler(_, message: Message):
-        user_id = message.from_user.id
-        if user_id != ADMIN_USER_ID:
-            await message.reply_text("❌ Solo administrador")
-            return
-        
-        args = message.text.split()[1:]
-        
-        if not args:
-            await message.reply_text(
-                "📝 *Uso:* `/add id1 id2 id3`\n\n"
-                "Ejemplo: `/add 123456789 987654321`"
-            )
-            return
-        
-        added = []
-        for arg in args:
-            if arg.isdigit():
-                user_id_int = int(arg)
-                if user_id_int not in authorized_users:
-                    authorized_users.add(user_id_int)
-                    added.append(str(user_id_int))
-        
-        if added:
-            await message.reply_text(
-                f"✅ *Usuarios añadidos:* {', '.join(added)}\n"
-                f"Total: {len(authorized_users)} usuarios"
-            )
-        else:
-            await message.reply_text("ℹ️ No se añadieron nuevos usuarios")
-    
-    @client.on_message(filters.command("remove"))
-    async def remove_handler(_, message: Message):
-        user_id = message.from_user.id
-        if user_id != ADMIN_USER_ID:
-            return
-        
-        args = message.text.split()[1:]
-        
-        if not args:
-            await message.reply_text(
-                "📝 *Uso:* `/remove id1 id2`\n\n"
-                "Ejemplo: `/remove 123456789`"
-            )
-            return
-        
-        removed = []
-        for arg in args:
-            if arg.isdigit():
-                user_id_int = int(arg)
-                if user_id_int in authorized_users and user_id_int != ADMIN_USER_ID:
-                    authorized_users.remove(user_id_int)
-                    if user_id_int in user_sessions:
-                        del user_sessions[user_id_int]
-                    removed.append(str(user_id_int))
-        
-        if removed:
-            await message.reply_text(f"❌ *Eliminados:* {', '.join(removed)}")
-        else:
-            await message.reply_text("ℹ️ No se eliminó ningún usuario")
-    
-    @client.on_message(filters.command("users"))
-    async def users_handler(_, message: Message):
-        user_id = message.from_user.id
-        if user_id != ADMIN_USER_ID:
-            return
-        
-        if not authorized_users:
-            await message.reply_text("📭 No hay usuarios autorizados")
-            return
-        
-        users_list = "\n".join([f"• `{uid}`" + (" 👑" if uid == ADMIN_USER_ID else "") for uid in authorized_users])
-        await message.reply_text(
-            f"👥 *Usuarios autorizados ({len(authorized_users)}):*\n\n{users_list}"
-        )
-    
-    @client.on_message(filters.command("clean"))
-    async def clean_handler(_, message: Message):
-        user_id = message.from_user.id
-        if user_id != ADMIN_USER_ID:
-            return
-        
-        # Limpiar sesiones inactivas
-        cleaned = 0
-        current_time = datetime.now()
-        for uid in list(user_sessions.keys()):
-            # Eliminar sesiones con más de 30 minutos
-            session = user_sessions[uid]
-            if 'timestamp' in session:
-                session_time = session['timestamp']
-                if (current_time - session_time).total_seconds() > 1800:  # 30 minutos
-                    del user_sessions[uid]
-                    cleaned += 1
-        
-        await message.reply_text(f"🧹 *Cache limpiada*\nSesiones eliminadas: {cleaned}")
-    
-    @client.on_message(filters.text & ~filters.command)
-    async def message_handler(_, message: Message):
-        user_id = message.from_user.id
-        
-        # Verificar autorización
-        if user_id not in authorized_users:
-            await message.reply_text("🔒 No autorizado")
-            return
-        
-        # Verificar si ya está procesando
-        if user_id in processing_users:
-            await message.reply_text("⏳ Tienes una descarga en curso. Espera...")
-            return
-        
-        text = message.text.strip()
-        
-        # Buscar enlace APKLis
-        apklis_pattern = r'https?://(?:www\.)?apklis\.cu/application/[a-zA-Z0-9._-]+'
-        match = re.search(apklis_pattern, text)
-        
-        if match:
-            # Guardar URL en sesión del usuario
-            user_sessions[user_id] = {
-                'apk_url': match.group(0),
-                'timestamp': datetime.now()
-            }
-            await message.reply_text(
-                "✅ *Enlace detectado*\n\n"
-                "📤 *Envía el número de versión*\n"
-                "Ejemplo: `34`"
-            )
-        elif user_id in user_sessions and 'apk_url' in user_sessions[user_id] and text.isdigit():
-            # Procesar descarga
-            version = text
-            apk_url = user_sessions[user_id]['apk_url']
-            
-            # Limpiar sesión
-            del user_sessions[user_id]
-            
-            # Iniciar descarga
-            processing_users.add(user_id)
-            try:
-                await download_and_send_apk(message, apk_url, version)
-            except Exception as e:
-                logger.error(f"Error en descarga: {e}")
-                await message.reply_text(f"❌ Error: {str(e)[:200]}")
-            finally:
-                processing_users.discard(user_id)
-        else:
-            await message.reply_text(
-                "📝 *Envía:*\n"
-                "1. Un enlace de APKLis.cu\n"
-                "2. El número de versión"
-            )
-
-# ========== DESCARGA Y ENVÍO DE APKs ==========
-async def download_large_file(url: str, filepath: str) -> bool:
-    """Descarga archivos grandes usando aiohttp"""
-    import aiohttp
-    
-    timeout = aiohttp.ClientTimeout(total=600)  # 10 minutos máximo
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    if API_ID and API_HASH:
         try:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    total_size = int(response.headers.get('content-length', 0))
-                    
-                    with open(filepath, 'wb') as f:
-                        downloaded = 0
-                        async for chunk in response.content.iter_chunked(8192 * 16):  # 128KB chunks
-                            if not chunk:
-                                continue
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Log progreso para archivos grandes
-                            if total_size > 10 * 1024 * 1024:  # >10MB
-                                percent = (downloaded / total_size) * 100
-                                if int(percent) % 20 == 0:  # Cada 20%
-                                    logger.info(f"Descarga: {percent:.1f}% ({downloaded/1024/1024:.1f}MB/{total_size/1024/1024:.1f}MB)")
-                    
-                    return True
-                else:
-                    logger.error(f"HTTP Error {response.status} para URL: {url}")
-                    return False
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout descargando: {url}")
-            return False
+            telethon_client = TelegramClient(
+                'apk_bot_session',
+                int(API_ID),
+                API_HASH
+            )
+            await telethon_client.start()
+            logger.info("✅ Cliente Telethon iniciado para descargas grandes")
+        except Exception as e:
+            logger.error(f"❌ Error iniciando Telethon: {e}")
+            telethon_client = None
+
+# ========== COMANDOS DEL BOT ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /start"""
+    user_id = update.effective_user.id
+    
+    if user_id in authorized_users:
+        welcome_msg = (
+            "🤖 *Bot de APKs APKLis 2026*\n\n"
+            "📲 *Cómo usar:*\n"
+            "1. Envía enlace APKLis.cu\n"
+            "2. Envía número de versión\n"
+            "3. Recibe el APK\n\n"
+            "⚡ *Soporta archivos hasta 2GB*\n"
+            "🛡 *Cifrado de extremo a extremo*\n\n"
+            "🛠 *Comandos Admin:*\n"
+            "• /add id1 id2 - Añadir usuarios\n"
+            "• /remove id - Eliminar usuario\n"
+            "• /users - Listar usuarios\n"
+            "• /status - Estado del bot"
+        )
+        await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(
+            "🔒 *Acceso restringido*\n\n"
+            "Contacta al administrador para acceder.",
+            parse_mode='Markdown'
+        )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /status"""
+    user_id = update.effective_user.id
+    if user_id not in authorized_users:
+        return
+    
+    status_msg = (
+        f"📊 *Estado del Bot - {datetime.now().year}*\n\n"
+        f"✅ Bot: Operativo\n"
+        f"👥 Usuarios: {len(authorized_users)}\n"
+        f"⏬ Descargas activas: {len(processing_users)}\n"
+        f"💾 Telethon: {'✅' if telethon_client else '❌'}\n"
+        f"📦 Memoria: {len(user_sessions)} sesiones"
+    )
+    await update.message.reply_text(status_msg, parse_mode='Markdown')
+
+async def add_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /add"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ Solo administrador")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📝 *Uso:* `/add id1 id2 id3`\n\n"
+            "Ejemplo: `/add 123456789 987654321`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    added = []
+    for arg in context.args:
+        if arg.isdigit():
+            user_id_int = int(arg)
+            if user_id_int not in authorized_users:
+                authorized_users.add(user_id_int)
+                added.append(str(user_id_int))
+    
+    if added:
+        await update.message.reply_text(
+            f"✅ *Usuarios añadidos:* {', '.join(added)}\n"
+            f"Total: {len(authorized_users)} usuarios",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("ℹ️ No se añadieron nuevos usuarios")
+
+async def remove_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /remove"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📝 *Uso:* `/remove id1 id2`\n\n"
+            "Ejemplo: `/remove 123456789`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    removed = []
+    for arg in context.args:
+        if arg.isdigit():
+            user_id_int = int(arg)
+            if user_id_int in authorized_users and user_id_int != ADMIN_USER_ID:
+                authorized_users.remove(user_id_int)
+                # Limpiar sesión del usuario
+                if user_id_int in user_sessions:
+                    del user_sessions[user_id_int]
+                removed.append(str(user_id_int))
+    
+    if removed:
+        await update.message.reply_text(f"❌ *Eliminados:* {', '.join(removed)}")
+    else:
+        await update.message.reply_text("ℹ️ No se eliminó ningún usuario")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /users"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+    
+    if not authorized_users:
+        await update.message.reply_text("📭 No hay usuarios autorizados")
+        return
+    
+    users_list = "\n".join([f"• `{uid}`" + (" 👑" if uid == ADMIN_USER_ID else "") for uid in authorized_users])
+    await update.message.reply_text(
+        f"👥 *Usuarios autorizados ({len(authorized_users)}):*\n\n{users_list}",
+        parse_mode='Markdown'
+    )
+
+# ========== MANEJO DE MENSAJES ==========
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja mensajes de texto"""
+    user_id = update.effective_user.id
+    
+    # Verificar autorización
+    if user_id not in authorized_users:
+        await update.message.reply_text("🔒 No autorizado")
+        return
+    
+    # Verificar si ya está procesando
+    if user_id in processing_users:
+        await update.message.reply_text("⏳ Tienes una descarga en curso. Espera...")
+        return
+    
+    text = update.message.text.strip()
+    
+    # Buscar enlace APKLis
+    apklis_pattern = r'https?://(?:www\.)?apklis\.cu/application/[a-zA-Z0-9._-]+'
+    match = re.search(apklis_pattern, text)
+    
+    if match:
+        # Guardar URL en sesión del usuario
+        user_sessions[user_id] = {'apk_url': match.group(0)}
+        await update.message.reply_text(
+            "✅ *Enlace detectado*\n\n"
+            "📤 *Envía el número de versión*\n"
+            "Ejemplo: `34`",
+            parse_mode='Markdown'
+        )
+    elif user_id in user_sessions and 'apk_url' in user_sessions[user_id] and text.isdigit():
+        # Procesar descarga
+        version = text
+        apk_url = user_sessions[user_id]['apk_url']
+        
+        # Limpiar sesión
+        del user_sessions[user_id]
+        
+        # Iniciar descarga
+        processing_users.add(user_id)
+        try:
+            await download_and_send_apk(update, context, apk_url, version)
         except Exception as e:
             logger.error(f"Error en descarga: {e}")
-            return False
+            await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+        finally:
+            processing_users.discard(user_id)
+    else:
+        await update.message.reply_text(
+            "📝 *Envía:*\n"
+            "1. Un enlace de APKLis.cu\n"
+            "2. El número de versión",
+            parse_mode='Markdown'
+        )
 
-async def download_and_send_apk(message: Message, apk_url: str, version: str):
-    """Descarga y envía el APK"""
-    status_msg = await message.reply_text("🔄 *Iniciando descarga...*")
+# ========== FUNCIONES DE DESCARGA MEJORADAS ==========
+async def try_download_with_fallback(urls: list, temp_path: str, status_msg, update: Update) -> Tuple[bool, str, int]:
+    """Intenta descargar desde múltiples URLs con fallback"""
+    timeout = ClientTimeout(total=300)  # 5 minutos
+    downloaded = False
+    final_url = ""
+    file_size = 0
+    
+    async with ClientSession(timeout=timeout) as session:
+        for i, url in enumerate(urls):
+            try:
+                logger.info(f"Intentando descargar desde: {url}")
+                
+                # Actualizar estado
+                if i > 0:
+                    await status_msg.edit_text(
+                        f"🔄 *Intento {i+1}/{len(urls)}*\n"
+                        f"Probando con extensión alternativa...",
+                        parse_mode='Markdown'
+                    )
+                
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        total_size = int(response.headers.get('content-length', 0))
+                        
+                        with open(temp_path, 'wb') as f:
+                            downloaded_size = 0
+                            async for chunk in response.content.iter_chunked(8192 * 8):  # 64KB chunks
+                                f.write(chunk)
+                                downloaded_size += len(chunk)
+                                
+                                # Log progreso para archivos grandes
+                                if total_size > 10 * 1024 * 1024:  # >10MB
+                                    percent = (downloaded_size / total_size) * 100
+                                    if int(percent) % 10 == 0:
+                                        logger.info(f"Descarga: {percent:.1f}% ({downloaded_size/1024/1024:.1f}MB/{total_size/1024/1024:.1f}MB)")
+                                        await status_msg.edit_text(
+                                            f"📥 *Descargando...*\n"
+                                            f"Progreso: {percent:.1f}%\n"
+                                            f"Tamaño: {total_size/1024/1024:.1f} MB\n"
+                                            f"URL: {i+1}/{len(urls)}",
+                                            parse_mode='Markdown'
+                                        )
+                        
+                        file_size = os.path.getsize(temp_path)
+                        if file_size > 0:
+                            downloaded = True
+                            final_url = url
+                            logger.info(f"✅ Descarga exitosa desde: {url} ({file_size/1024/1024:.2f} MB)")
+                            break
+                        
+            except ClientError as e:
+                logger.warning(f"Error con URL {url}: {e}")
+                continue
+            except Exception as e:
+                logger.error(f"Error inesperado: {e}")
+                continue
+    
+    return downloaded, final_url, file_size
+
+async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TYPE, apk_url: str, version: str):
+    """Descarga y envía el APK con fallback a .apklis"""
+    status_msg = await update.message.reply_text("🔄 *Preparando descarga...*", parse_mode='Markdown')
     
     try:
         # Extraer información
         package_name = apk_url.split('/')[-1]
         
-        # Generar URL de descarga
-        download_url = f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apk?download_id={FIXED_DOWNLOAD_ID}"
+        # Generar URLs alternativas (primero .apk, luego .apklis)
+        urls_to_try = [
+            f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apk?download_id={FIXED_DOWNLOAD_ID}",
+            f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apklis?download_id={FIXED_DOWNLOAD_ID}"
+        ]
         
-        # Nombre del archivo
-        safe_filename = f"{package_name}-v{version}.apk"
-        temp_path = f"temp_{hashlib.md5(safe_filename.encode()).hexdigest()[:8]}.apk"
+        # Nombre del archivo (mantiene extensión original del enlace exitoso)
+        safe_filename_base = f"{package_name}-v{version}"
+        temp_path = f"temp_{hashlib.md5(safe_filename_base.encode()).hexdigest()[:8]}"
         
-        # Paso 1: Descargar
-        await status_msg.edit_text("📥 *Descargando APK...*\n_Esto puede tomar varios minutos para archivos grandes_")
+        # Paso 1: Intentar descarga con fallback
+        await status_msg.edit_text(
+            "📥 *Buscando archivo disponible...*\n"
+            "Intentando con extensión .apk",
+            parse_mode='Markdown'
+        )
         
-        # Usar aiohttp para descarga asíncrona
-        download_success = await download_large_file(download_url, temp_path)
+        # Intentar descargar desde las URLs
+        downloaded, final_url, file_size = await try_download_with_fallback(urls_to_try, temp_path, status_msg, update)
         
-        if not download_success or not os.path.exists(temp_path):
-            await status_msg.edit_text("❌ *Error en la descarga*\n\nVerifica:\n• Que la versión sea correcta\n• Que la aplicación exista")
+        if not downloaded:
+            await status_msg.edit_text(
+                "❌ *Error en la descarga*\n\n"
+                "No se pudo descargar el archivo con ninguna extensión.\n"
+                "Verifica:\n"
+                "• Que la versión sea correcta\n"
+                "• Que la aplicación exista\n"
+                "• Tu conexión a internet",
+                parse_mode='Markdown'
+            )
             return
         
-        # Verificar tamaño del archivo
-        file_size = os.path.getsize(temp_path)
-        logger.info(f"Archivo descargado: {safe_filename} ({file_size/1024/1024:.2f} MB)")
+        # Determinar extensión basada en la URL exitosa
+        if '.apklis' in final_url:
+            file_extension = '.apklis'
+            temp_path_with_ext = f"{temp_path}.apklis"
+            os.rename(temp_path, temp_path_with_ext)
+            temp_path = temp_path_with_ext
+            final_filename = f"{safe_filename_base}.apklis"
+        else:
+            file_extension = '.apk'
+            temp_path_with_ext = f"{temp_path}.apk"
+            os.rename(temp_path, temp_path_with_ext)
+            temp_path = temp_path_with_ext
+            final_filename = f"{safe_filename_base}.apk"
         
-        # Paso 2: Enviar
-        await status_msg.edit_text("📤 *Enviando APK...*\n_Usando protocolo seguro_")
+        logger.info(f"Archivo descargado: {final_filename} ({file_size/1024/1024:.2f} MB) desde {final_url}")
+        
+        # Paso 2: Enviar archivo
+        await status_msg.edit_text(
+            f"📤 *Enviando archivo...*\n"
+            f"Tamaño: {file_size/1024/1024:.1f} MB\n"
+            f"Extensión: {file_extension}\n"
+            f"_Usando protocolo seguro_",
+            parse_mode='Markdown'
+        )
         
         try:
-            caption = f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB\n✅ Descargado con éxito"
-            
-            # Para archivos grandes, mostrar progreso
-            progress_msg = None
-            if file_size > 20 * 1024 * 1024:  # >20MB
-                progress_msg = await message.reply_text("📤 Enviando archivo... (0%)")
+            # Para archivos grandes (>50MB), usar Telethon si está disponible
+            if file_size > 50 * 1024 * 1024 and telethon_client:
+                await status_msg.edit_text("⚡ *Enviando archivo grande...*", parse_mode='Markdown')
                 
-                last_percent = 0
-                def progress(current, total):
-                    nonlocal last_percent
-                    percent = (current / total) * 100
-                    current_percent = int(percent)
-                    if current_percent > last_percent and current_percent % 10 == 0:
-                        asyncio.create_task(progress_msg.edit_text(f"📤 Enviando archivo... ({current_percent}%)"))
-                        last_percent = current_percent
-                
-                await app.send_document(
-                    chat_id=message.chat.id,
-                    document=temp_path,
-                    file_name=safe_filename,
-                    caption=caption,
-                    progress=progress
+                # Enviar con Telethon
+                await telethon_client.send_file(
+                    await telethon_client.get_input_entity(update.effective_chat.id),
+                    temp_path,
+                    caption=(
+                        f"📦 *{package_name}*\n"
+                        f"🔢 Versión: {version}\n"
+                        f"💾 Tamaño: {file_size/1024/1024:.1f}MB\n"
+                        f"📎 Extensión: {file_extension}\n"
+                        f"✅ Descargado con éxito"
+                    ),
+                    force_document=True
                 )
-                
-                if progress_msg:
-                    await progress_msg.delete()
             else:
-                await app.send_document(
-                    chat_id=message.chat.id,
-                    document=temp_path,
-                    file_name=safe_filename,
-                    caption=caption
-                )
+                # Enviar con python-telegram-bot (hasta 50MB)
+                with open(temp_path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        filename=final_filename,
+                        caption=(
+                            f"📦 *{package_name}*\n"
+                            f"🔢 Versión: {version}\n"
+                            f"💾 Tamaño: {file_size/1024/1024:.1f}MB\n"
+                            f"📎 Extensión: {file_extension}"
+                        ),
+                        parse_mode='Markdown'
+                    )
             
             # Limpiar
             await status_msg.delete()
             
-        except FloodWait as e:
-            logger.warning(f"Flood wait: {e.value} segundos")
-            await status_msg.edit_text(f"⏳ Demasiadas solicitudes. Espera {e.value} segundos...")
-            await asyncio.sleep(e.value)
-            await download_and_send_apk(message, apk_url, version)
-            
-        except BadRequest as e:
-            logger.error(f"BadRequest: {e}")
-            await status_msg.edit_text(f"❌ Error de Telegram: {str(e)[:100]}")
-            
         finally:
             # Limpiar archivo temporal
             if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
+                os.remove(temp_path)
                 
     except Exception as e:
-        logger.error(f"Error enviando APK: {e}")
-        await status_msg.edit_text(f"❌ *Error:* `{str(e)[:100]}`")
+        logger.error(f"Error enviando archivo: {e}")
+        await status_msg.edit_text(
+            f"❌ *Error al enviar:*\n`{str(e)[:100]}`\n\n"
+            f"El archivo se descargó pero no se pudo enviar.",
+            parse_mode='Markdown'
+        )
+        # Limpiar archivo temporal en caso de error
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 # ========== SERVIDOR WEB PARA RENDER ==========
 async def health_check(request):
     """Endpoint de salud para Render"""
     return web.json_response({
         "status": "healthy",
-        "service": "APKLis Downloader Bot 2026",
-        "bot_status": "running" if app else "stopped",
+        "year": datetime.now().year,
+        "service": "APKLis Downloader Bot",
         "users_count": len(authorized_users),
         "active_downloads": len(processing_users),
-        "timestamp": datetime.now().isoformat(),
-        "year": 2026
+        "telethon_available": telethon_client is not None,
+        "timestamp": datetime.now().isoformat()
     })
 
 async def start_web_server():
     """Inicia el servidor web para Render"""
-    global web_runner
+    app = web.Application()
     
-    web_app = web.Application()
-    web_app.router.add_get('/', health_check)
-    web_app.router.add_get('/health', health_check)
-    web_app.router.add_get('/status', health_check)
+    # Endpoints
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/status', health_check)
     
-    web_runner = web.AppRunner(web_app)
-    await web_runner.setup()
+    # Configurar el runner
+    runner = web.AppRunner(app)
+    await runner.setup()
     
-    site = web.TCPSite(web_runner, '0.0.0.0', PORT)
+    # Iniciar en el puerto especificado
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
     logger.info(f"🌐 Servidor web iniciado en puerto {PORT}")
-    return web_runner
-
-# ========== MANEJO DE SEÑALES ==========
-async def shutdown(signal=None):
-    """Apagado limpio de la aplicación"""
-    logger.info("🛑 Recibida señal de apagado...")
+    logger.info(f"📅 Año: {datetime.now().year}")
+    logger.info(f"🤖 Bot listo para recibir comandos")
     
-    # Detener Pyrogram
-    if app and app.is_initialized:
-        logger.info("👋 Deteniendo bot de Telegram...")
-        await app.stop()
-    
-    # Detener servidor web
-    if web_runner:
-        logger.info("🌐 Deteniendo servidor web...")
-        await web_runner.cleanup()
-    
-    logger.info("✅ Aplicación apagada correctamente")
-    os._exit(0)
+    return runner
 
 # ========== INICIALIZACIÓN Y EJECUCIÓN ==========
 async def main():
     """Función principal asíncrona"""
+    global telegram_app
+    
     logger.info("🚀 Iniciando APKLis Bot 2026...")
     
-    # Registrar manejadores de señales
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGABRT):
-        signal.signal(sig, lambda s, f: asyncio.create_task(shutdown(s)))
+    # 1. Inicializar Telethon para archivos grandes
+    await init_telethon()
+    
+    # 2. Crear aplicación de Telegram
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    
+    # 3. Registrar handlers
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("status", status))
+    telegram_app.add_handler(CommandHandler("add", add_users))
+    telegram_app.add_handler(CommandHandler("remove", remove_users))
+    telegram_app.add_handler(CommandHandler("users", list_users))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # 4. Inicializar bot
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
+    
+    logger.info("✅ Bot de Telegram iniciado")
+    
+    # 5. Iniciar servidor web (para Render)
+    web_runner = await start_web_server()
+    
+    # 6. Mantener corriendo
+    try:
+        await asyncio.Future()  # Ejecutar indefinidamente
+    except asyncio.CancelledError:
+        logger.info("👋 Apagando bot...")
+        
+        # Apagar limpiamente
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+        
+        if telethon_client:
+            await telethon_client.disconnect()
+        
+        await web_runner.cleanup()
+
+def run():
+    """Punto de entrada para Render"""
+    # Configurar asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
     try:
-        # 1. Inicializar Pyrogram
-        await init_pyrogram()
-        
-        # 2. Iniciar servidor web (para Render)
-        if RENDER:
-            logger.info("🚀 Ejecutando en Render")
-            await start_web_server()
-        else:
-            logger.info("💻 Ejecutando localmente")
-        
-        # 3. Información de estado
-        logger.info(f"📊 Usuarios autorizados: {len(authorized_users)}")
-        logger.info(f"🔧 API ID/HASH: {'Configurado' if API_ID and API_HASH else 'No configurado'}")
-        logger.info(f"👑 Admin ID: {ADMIN_USER_ID}")
-        
-        # 4. Mantener la aplicación corriendo
-        logger.info("✅ Bot listo y escuchando mensajes...")
-        await idle()
-        
-    except Exception as e:
-        logger.error(f"❌ Error crítico: {e}")
-        await shutdown()
-    finally:
-        await shutdown()
-
-# ========== PUNTO DE ENTRADA ==========
-if __name__ == '__main__':
-    # Configurar asyncio para Render
-    try:
-        if RENDER:
-            # En Render, usar el loop actual
-            asyncio.run(main())
-        else:
-            # Localmente, crear nuevo loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(main())
+        # Ejecutar bot indefinidamente
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("🛑 Bot detenido por usuario")
     except Exception as e:
-        logger.error(f"❌ Error fatal: {e}")
+        logger.error(f"❌ Error crítico: {e}")
+    finally:
+        loop.close()
+        logger.info("👋 Bot finalizado")
+
+if __name__ == '__main__':
+    run()
