@@ -4,12 +4,14 @@ import asyncio
 import logging
 from typing import Dict, Set
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from aiohttp import web
-from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
 import hashlib
+
+# Pyrogram imports
+from pyrogram import Client, filters
+from pyrogram.types import Message, InputMediaDocument
+from pyrogram.enums import ParseMode
+from pyrogram.errors import BadRequest, FloodWait
 
 # Configurar logging
 logging.basicConfig(
@@ -42,32 +44,38 @@ user_sessions: Dict[int, Dict] = {}  # Almacena URLs pendientes por usuario
 # URL base fija
 FIXED_DOWNLOAD_ID = "d794ab9e-2e58-4ac9-97da-237b86d1a6c3"
 
-# Variable global para la aplicación
-telegram_app = None
-telethon_client = None
+# Variable global para la aplicación Pyrogram
+pyro_app = None
 
-# ========== INICIALIZACIÓN TELETHON (para archivos grandes) ==========
-async def init_telethon():
-    """Inicializa cliente Telethon para archivos grandes"""
-    global telethon_client
+# ========== INICIALIZACIÓN PYROGRAM ==========
+async def init_pyrogram():
+    """Inicializa cliente Pyrogram"""
+    global pyro_app
     
-    if API_ID and API_HASH:
-        try:
-            telethon_client = TelegramClient(
-                'apk_bot_session',
-                int(API_ID),
-                API_HASH
-            )
-            await telethon_client.start()
-            logger.info("✅ Cliente Telethon iniciado para descargas grandes")
-        except Exception as e:
-            logger.error(f"❌ Error iniciando Telethon: {e}")
-            telethon_client = None
+    try:
+        pyro_app = Client(
+            "apk_bot",
+            api_id=int(API_ID) if API_ID else None,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+            parse_mode=ParseMode.MARKDOWN,
+            max_concurrent_transmissions=5
+        )
+        
+        await pyro_app.start()
+        logger.info("✅ Cliente Pyrogram iniciado")
+        logger.info(f"🤖 Bot: @{(await pyro_app.get_me()).username}")
+        
+    except Exception as e:
+        logger.error(f"❌ Error iniciando Pyrogram: {e}")
+        pyro_app = None
+        raise
 
 # ========== COMANDOS DEL BOT ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@pyro_app.on_message(filters.command("start"))
+async def start_command(client: Client, message: Message):
     """Comando /start"""
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     
     if user_id in authorized_users:
         welcome_msg = (
@@ -84,17 +92,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /users - Listar usuarios\n"
             "• /status - Estado del bot"
         )
-        await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+        await message.reply_text(welcome_msg)
     else:
-        await update.message.reply_text(
+        await message.reply_text(
             "🔒 *Acceso restringido*\n\n"
-            "Contacta al administrador para acceder.",
-            parse_mode='Markdown'
+            "Contacta al administrador para acceder."
         )
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@pyro_app.on_message(filters.command("status"))
+async def status_command(client: Client, message: Message):
     """Comando /status"""
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     if user_id not in authorized_users:
         return
     
@@ -103,28 +111,30 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Bot: Operativo\n"
         f"👥 Usuarios: {len(authorized_users)}\n"
         f"⏬ Descargas activas: {len(processing_users)}\n"
-        f"💾 Telethon: {'✅' if telethon_client else '❌'}\n"
+        f"💾 Pyrogram: {'✅' if pyro_app else '❌'}\n"
         f"📦 Memoria: {len(user_sessions)} sesiones"
     )
-    await update.message.reply_text(status_msg, parse_mode='Markdown')
+    await message.reply_text(status_msg)
 
-async def add_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@pyro_app.on_message(filters.command("add"))
+async def add_users_command(client: Client, message: Message):
     """Comando /add"""
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Solo administrador")
+        await message.reply_text("❌ Solo administrador")
         return
     
-    if not context.args:
-        await update.message.reply_text(
+    args = message.text.split()[1:]
+    
+    if not args:
+        await message.reply_text(
             "📝 *Uso:* `/add id1 id2 id3`\n\n"
-            "Ejemplo: `/add 123456789 987654321`",
-            parse_mode='Markdown'
+            "Ejemplo: `/add 123456789 987654321`"
         )
         return
     
     added = []
-    for arg in context.args:
+    for arg in args:
         if arg.isdigit():
             user_id_int = int(arg)
             if user_id_int not in authorized_users:
@@ -132,30 +142,31 @@ async def add_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 added.append(str(user_id_int))
     
     if added:
-        await update.message.reply_text(
+        await message.reply_text(
             f"✅ *Usuarios añadidos:* {', '.join(added)}\n"
-            f"Total: {len(authorized_users)} usuarios",
-            parse_mode='Markdown'
+            f"Total: {len(authorized_users)} usuarios"
         )
     else:
-        await update.message.reply_text("ℹ️ No se añadieron nuevos usuarios")
+        await message.reply_text("ℹ️ No se añadieron nuevos usuarios")
 
-async def remove_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@pyro_app.on_message(filters.command("remove"))
+async def remove_users_command(client: Client, message: Message):
     """Comando /remove"""
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
         return
     
-    if not context.args:
-        await update.message.reply_text(
+    args = message.text.split()[1:]
+    
+    if not args:
+        await message.reply_text(
             "📝 *Uso:* `/remove id1 id2`\n\n"
-            "Ejemplo: `/remove 123456789`",
-            parse_mode='Markdown'
+            "Ejemplo: `/remove 123456789`"
         )
         return
     
     removed = []
-    for arg in context.args:
+    for arg in args:
         if arg.isdigit():
             user_id_int = int(arg)
             if user_id_int in authorized_users and user_id_int != ADMIN_USER_ID:
@@ -166,42 +177,43 @@ async def remove_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 removed.append(str(user_id_int))
     
     if removed:
-        await update.message.reply_text(f"❌ *Eliminados:* {', '.join(removed)}")
+        await message.reply_text(f"❌ *Eliminados:* {', '.join(removed)}")
     else:
-        await update.message.reply_text("ℹ️ No se eliminó ningún usuario")
+        await message.reply_text("ℹ️ No se eliminó ningún usuario")
 
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@pyro_app.on_message(filters.command("users"))
+async def list_users_command(client: Client, message: Message):
     """Comando /users"""
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     if user_id != ADMIN_USER_ID:
         return
     
     if not authorized_users:
-        await update.message.reply_text("📭 No hay usuarios autorizados")
+        await message.reply_text("📭 No hay usuarios autorizados")
         return
     
     users_list = "\n".join([f"• `{uid}`" + (" 👑" if uid == ADMIN_USER_ID else "") for uid in authorized_users])
-    await update.message.reply_text(
-        f"👥 *Usuarios autorizados ({len(authorized_users)}):*\n\n{users_list}",
-        parse_mode='Markdown'
+    await message.reply_text(
+        f"👥 *Usuarios autorizados ({len(authorized_users)}):*\n\n{users_list}"
     )
 
 # ========== MANEJO DE MENSAJES ==========
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@pyro_app.on_message(filters.text & ~filters.command)
+async def handle_message(client: Client, message: Message):
     """Maneja mensajes de texto"""
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     
     # Verificar autorización
     if user_id not in authorized_users:
-        await update.message.reply_text("🔒 No autorizado")
+        await message.reply_text("🔒 No autorizado")
         return
     
     # Verificar si ya está procesando
     if user_id in processing_users:
-        await update.message.reply_text("⏳ Tienes una descarga en curso. Espera...")
+        await message.reply_text("⏳ Tienes una descarga en curso. Espera...")
         return
     
-    text = update.message.text.strip()
+    text = message.text.strip()
     
     # Buscar enlace APKLis
     apklis_pattern = r'https?://(?:www\.)?apklis\.cu/application/[a-zA-Z0-9._-]+'
@@ -210,11 +222,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if match:
         # Guardar URL en sesión del usuario
         user_sessions[user_id] = {'apk_url': match.group(0)}
-        await update.message.reply_text(
+        await message.reply_text(
             "✅ *Enlace detectado*\n\n"
             "📤 *Envía el número de versión*\n"
-            "Ejemplo: `34`",
-            parse_mode='Markdown'
+            "Ejemplo: `34`"
         )
     elif user_id in user_sessions and 'apk_url' in user_sessions[user_id] and text.isdigit():
         # Procesar descarga
@@ -227,18 +238,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Iniciar descarga
         processing_users.add(user_id)
         try:
-            await download_and_send_apk(update, context, apk_url, version)
+            await download_and_send_apk(client, message, apk_url, version)
         except Exception as e:
             logger.error(f"Error en descarga: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
         finally:
             processing_users.discard(user_id)
     else:
-        await update.message.reply_text(
+        await message.reply_text(
             "📝 *Envía:*\n"
             "1. Un enlace de APKLis.cu\n"
-            "2. El número de versión",
-            parse_mode='Markdown'
+            "2. El número de versión"
         )
 
 # ========== DESCARGA Y ENVÍO DE APKs ==========
@@ -269,9 +279,9 @@ async def download_large_file(url: str, filepath: str):
                 logger.error(f"HTTP Error {response.status}")
                 return False
 
-async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TYPE, apk_url: str, version: str):
+async def download_and_send_apk(client: Client, message: Message, apk_url: str, version: str):
     """Descarga y envía el APK (soporta hasta 2GB)"""
-    status_msg = await update.message.reply_text("🔄 *Iniciando descarga...*", parse_mode='Markdown')
+    status_msg = await message.reply_text("🔄 *Iniciando descarga...*")
     
     try:
         # Extraer información
@@ -285,13 +295,13 @@ async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TY
         temp_path = f"temp_{hashlib.md5(safe_filename.encode()).hexdigest()[:8]}.apk"
         
         # Paso 1: Descargar
-        await status_msg.edit_text("📥 *Descargando APK...*\n_Esto puede tomar varios minutos para archivos grandes_", parse_mode='Markdown')
+        await status_msg.edit_text("📥 *Descargando APK...*\n_Esto puede tomar varios minutos para archivos grandes_")
         
         # Usar aiohttp para descarga asíncrona
         download_success = await download_large_file(download_url, temp_path)
         
         if not download_success or not os.path.exists(temp_path):
-            await status_msg.edit_text("❌ *Error en la descarga*\n\nVerifica:\n• Que la versión sea correcta\n• Que la aplicación exista", parse_mode='Markdown')
+            await status_msg.edit_text("❌ *Error en la descarga*\n\nVerifica:\n• Que la versión sea correcta\n• Que la aplicación exista")
             return
         
         # Verificar tamaño del archivo
@@ -299,33 +309,49 @@ async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TY
         logger.info(f"Archivo descargado: {safe_filename} ({file_size/1024/1024:.2f} MB)")
         
         # Paso 2: Enviar
-        await status_msg.edit_text("📤 *Enviando APK...*\n_Usando protocolo seguro_", parse_mode='Markdown')
+        await status_msg.edit_text("📤 *Enviando APK...*\n_Usando protocolo seguro_")
         
         try:
-            # Para archivos grandes (>50MB), usar Telethon si está disponible
-            if file_size > 50 * 1024 * 1024 and telethon_client:
-                await status_msg.edit_text("⚡ *Enviando archivo grande...*", parse_mode='Markdown')
+            # Pyrogram soporta archivos grandes directamente (hasta 2GB con API ID/HASH)
+            caption = f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB\n✅ Descargado con éxito"
+            
+            # Para archivos grandes, mostrar progreso
+            if file_size > 50 * 1024 * 1024:  # >50MB
+                progress_msg = await message.reply_text(f"📤 Enviando archivo grande... (0%)")
                 
-                # Enviar con Telethon
-                await telethon_client.send_file(
-                    await telethon_client.get_input_entity(update.effective_chat.id),
-                    temp_path,
-                    caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB\n✅ Descargado con éxito",
-                    force_document=True
+                def progress(current, total):
+                    percent = (current / total) * 100
+                    if int(percent) % 10 == 0:  # Actualizar cada 10%
+                        asyncio.create_task(progress_msg.edit_text(f"📤 Enviando archivo grande... ({int(percent)}%)"))
+                
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=temp_path,
+                    file_name=safe_filename,
+                    caption=caption,
+                    progress=progress
                 )
+                await progress_msg.delete()
             else:
-                # Enviar con python-telegram-bot (hasta 50MB)
-                with open(temp_path, 'rb') as f:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=f,
-                        filename=safe_filename,
-                        caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB",
-                        parse_mode='Markdown'
-                    )
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=temp_path,
+                    file_name=safe_filename,
+                    caption=caption
+                )
             
             # Limpiar
             await status_msg.delete()
+            
+        except FloodWait as e:
+            logger.warning(f"Flood wait: {e.value} segundos")
+            await status_msg.edit_text(f"⏳ Demasiadas solicitudes. Espera {e.value} segundos...")
+            await asyncio.sleep(e.value)
+            await download_and_send_apk(client, message, apk_url, version)
+            
+        except BadRequest as e:
+            logger.error(f"BadRequest: {e}")
+            await status_msg.edit_text(f"❌ Error de Telegram: {str(e)}")
             
         finally:
             # Limpiar archivo temporal
@@ -334,7 +360,7 @@ async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TY
                 
     except Exception as e:
         logger.error(f"Error enviando APK: {e}")
-        await status_msg.edit_text(f"❌ *Error:* `{str(e)[:100]}`", parse_mode='Markdown')
+        await status_msg.edit_text(f"❌ *Error:* `{str(e)[:100]}`")
 
 # ========== SERVIDOR WEB PARA RENDER ==========
 async def health_check(request):
@@ -342,10 +368,10 @@ async def health_check(request):
     return web.json_response({
         "status": "healthy",
         "year": 2026,
-        "service": "APKLis Downloader Bot",
+        "service": "APKLis Downloader Bot (Pyrogram)",
         "users_count": len(authorized_users),
         "active_downloads": len(processing_users),
-        "telethon_available": telethon_client is not None,
+        "pyrogram_available": pyro_app is not None,
         "timestamp": datetime.now().isoformat()
     })
 
@@ -375,52 +401,33 @@ async def start_web_server():
 # ========== INICIALIZACIÓN Y EJECUCIÓN ==========
 async def main():
     """Función principal asíncrona"""
-    global telegram_app
+    global pyro_app
     
-    logger.info("🚀 Iniciando APKLis Bot 2026...")
+    logger.info("🚀 Iniciando APKLis Bot 2026 (Pyrogram)...")
     
-    # 1. Inicializar Telethon para archivos grandes
-    await init_telethon()
+    # 1. Inicializar Pyrogram
+    await init_pyrogram()
     
-    # 2. Crear aplicación de Telegram
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    
-    # 3. Registrar handlers
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("status", status))
-    telegram_app.add_handler(CommandHandler("add", add_users))
-    telegram_app.add_handler(CommandHandler("remove", remove_users))
-    telegram_app.add_handler(CommandHandler("users", list_users))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # 4. Inicializar bot
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
-    
-    logger.info("✅ Bot de Telegram iniciado")
-    
-    # 5. Iniciar servidor web (para Render)
+    # 2. Iniciar servidor web (para Render)
     web_runner = await start_web_server()
     
-    # 6. Mantener corriendo
+    logger.info("✅ Bot de Telegram iniciado con Pyrogram")
+    
+    # 3. Mantener corriendo
     try:
-        await asyncio.Future()  # Ejecutar indefinidamente
-    except asyncio.CancelledError:
-        logger.info("👋 Apagando bot...")
-        
+        # Pyrogram maneja sus propias actualizaciones
+        await pyro_app.idle()
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot detenido por usuario")
+    except Exception as e:
+        logger.error(f"❌ Error crítico: {e}")
+    finally:
         # Apagar limpiamente
-        await telegram_app.updater.stop()
-        await telegram_app.stop()
-        await telegram_app.shutdown()
-        
-        if telethon_client:
-            await telethon_client.disconnect()
-        
+        logger.info("👋 Apagando bot...")
+        if pyro_app:
+            await pyro_app.stop()
         await web_runner.cleanup()
+        logger.info("👋 Bot finalizado")
 
 def run():
     """Punto de entrada para Render"""
@@ -429,7 +436,7 @@ def run():
     asyncio.set_event_loop(loop)
     
     try:
-        # Ejecutar bot indefinidamente
+        # Ejecutar bot
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("🛑 Bot detenido por usuario")
@@ -437,7 +444,6 @@ def run():
         logger.error(f"❌ Error crítico: {e}")
     finally:
         loop.close()
-        logger.info("👋 Bot finalizado")
 
 if __name__ == '__main__':
     run()
