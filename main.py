@@ -3,13 +3,14 @@ import re
 import asyncio
 import logging
 import aiohttp
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, Tuple
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from aiohttp import web
 from telethon import TelegramClient
 import hashlib
+import time
 
 # Configurar logging
 logging.basicConfig(
@@ -31,19 +32,19 @@ if not BOT_TOKEN:
 if not API_ID or not API_HASH:
     logger.warning("API_ID o API_HASH no configurados. Descargas limitadas a 50MB")
 
-# Configuración de detección automática
-VERSION_MIN = 1
-VERSION_MAX = 65535
-MAX_CONCURRENT_SCANS = 3  # Máximo de escaneos concurrentes por usuario
-SCAN_TIMEOUT = 10  # Segundos de timeout por intento
+# Configuración
+VERSION_MAX = 50000  # Límite máximo
+SCAN_TIMEOUT = 5  # Segundos por intento
+MAX_WORKERS = 10  # Máximo de verificaciones concurrentes
 
 # Almacenamiento en memoria
 authorized_users: Set[int] = set()
 if ADMIN_USER_ID:
     authorized_users.add(ADMIN_USER_ID)
 
-processing_users: Set[int] = set()
+processing_users: Dict[int, Dict] = {}  # Usuarios procesando con su estado
 user_sessions: Dict[int, Dict] = {}  # Almacena URLs pendientes por usuario
+active_scans: Dict[int, asyncio.Task] = {}  # Tareas de escaneo activas
 
 # URL base fija
 FIXED_DOWNLOAD_ID = "d794ab9e-2e58-4ac9-97da-237b86d1a6c3"
@@ -51,11 +52,344 @@ FIXED_DOWNLOAD_ID = "d794ab9e-2e58-4ac9-97da-237b86d1a6c3"
 # Variable global para la aplicación
 telegram_app = None
 telethon_client = None
-http_session = None  # Sesión HTTP compartida
+http_session = None
 
-# ========== INICIALIZACIÓN TELETHON (para archivos grandes) ==========
+# ========== TECLADOS INLINE ==========
+def get_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Teclado para cancelar operaciones"""
+    keyboard = [
+        [InlineKeyboardButton("❌ Cancelar", callback_data="cancel_operation")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_digit_selection_keyboard() -> InlineKeyboardMarkup:
+    """Teclado para seleccionar dígitos"""
+    keyboard = [
+        [
+            InlineKeyboardButton("1 dígito (1-9)", callback_data="digits_1"),
+            InlineKeyboardButton("2 dígitos (10-99)", callback_data="digits_2")
+        ],
+        [
+            InlineKeyboardButton("3 dígitos (100-999)", callback_data="digits_3"),
+            InlineKeyboardButton("4 dígitos (1000-9999)", callback_data="digits_4")
+        ],
+        [
+            InlineKeyboardButton("5 dígitos (10000-50000)", callback_data="digits_5"),
+            InlineKeyboardButton("❌ Cancelar", callback_data="cancel_operation")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_version_options_keyboard() -> InlineKeyboardMarkup:
+    """Teclado para opciones de versión"""
+    keyboard = [
+        [InlineKeyboardButton("🎯 Detección automática", callback_data="auto_detect")],
+        [InlineKeyboardButton("🔢 Especificar versión", callback_data="manual_version")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="cancel_operation")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ========== MANEJO DE CALLBACKS ==========
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja callbacks de botones inline"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    # Cancelar operación
+    if data == "cancel_operation":
+        await cancel_user_operation(user_id, query)
+        return
+    
+    # Selección de dígitos
+    if data.startswith("digits_"):
+        digits = int(data.split("_")[1])
+        await handle_digit_selection(user_id, digits, query, context)
+        return
+    
+    # Opciones de versión
+    if data == "auto_detect":
+        await handle_auto_detect(user_id, query, context)
+        return
+    
+    if data == "manual_version":
+        await query.edit_message_text(
+            "🔢 *Ingresa el número de versión:*\n\n"
+            "Ejemplo: `45` para versión 45",
+            parse_mode='Markdown',
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+    
+    await query.edit_message_text("⚠️ Opción no reconocida")
+
+async def cancel_user_operation(user_id: int, query):
+    """Cancela todas las operaciones del usuario"""
+    # Cancelar escaneo activo
+    if user_id in active_scans:
+        try:
+            active_scans[user_id].cancel()
+            logger.info(f"Escaneo cancelado para usuario {user_id}")
+        except:
+            pass
+        finally:
+            active_scans.pop(user_id, None)
+    
+    # Limpiar estados
+    processing_users.pop(user_id, None)
+    user_sessions.pop(user_id, None)
+    
+    await query.edit_message_text("✅ Operación cancelada")
+
+async def handle_digit_selection(user_id: int, digits: int, query, context):
+    """Maneja la selección de dígitos"""
+    if user_id not in user_sessions:
+        await query.edit_message_text("⚠️ Sesión expirada. Envía el enlace nuevamente.")
+        return
+    
+    # Calcular rango basado en dígitos
+    if digits == 1:
+        start, end = 1, 9
+    elif digits == 2:
+        start, end = 10, 99
+    elif digits == 3:
+        start, end = 100, 999
+    elif digits == 4:
+        start, end = 1000, 9999
+    elif digits == 5:
+        start, end = 10000, VERSION_MAX
+    else:
+        await query.edit_message_text("❌ Número de dígitos no válido")
+        return
+    
+    package_name = user_sessions[user_id].get('package_name')
+    
+    # Iniciar escaneo
+    processing_users[user_id] = {
+        'status': 'scanning',
+        'package_name': package_name,
+        'range': (start, end),
+        'current': start,
+        'found': None
+    }
+    
+    await query.edit_message_text(
+        f"🔍 *Escaneando versiones...*\n\n"
+        f"📊 *Rango:* {start} - {end}\n"
+        f"📦 *Paquete:* `{package_name}`\n\n"
+        f"⏳ *Escaneando... 0%*",
+        parse_mode='Markdown',
+        reply_markup=get_cancel_keyboard()
+    )
+    
+    # Iniciar tarea de escaneo
+    task = asyncio.create_task(
+        scan_version_range(user_id, package_name, start, end, query.message.message_id)
+    )
+    active_scans[user_id] = task
+
+async def handle_auto_detect(user_id: int, query, context):
+    """Inicia detección automática con todos los dígitos"""
+    if user_id not in user_sessions:
+        await query.edit_message_text("⚠️ Sesión expirada. Envía el enlace nuevamente.")
+        return
+    
+    package_name = user_sessions[user_id].get('package_name')
+    
+    await query.edit_message_text(
+        "🎯 *Selecciona el rango de búsqueda:*\n\n"
+        "¿Cuántos dígitos tiene la versión?",
+        parse_mode='Markdown',
+        reply_markup=get_digit_selection_keyboard()
+    )
+
+# ========== ESCANEO DE VERSIONES ==========
+async def check_version_fast(package_name: str, version: int) -> bool:
+    """Verificación rápida de versión con timeout corto"""
+    url = f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apk?download_id={FIXED_DOWNLOAD_ID}"
+    
+    try:
+        async with http_session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=3)) as response:
+            if response.status == 200:
+                content_length = response.headers.get('Content-Length', '0')
+                return int(content_length) > 1024 * 10  # Al menos 10KB
+    except:
+        pass
+    return False
+
+async def scan_version_range(user_id: int, package_name: str, start: int, end: int, message_id: int):
+    """Escanea un rango de versiones de forma concurrente"""
+    try:
+        total_versions = end - start + 1
+        versions_to_check = list(range(start, end + 1))
+        found_version = None
+        
+        # Dividir en lotes para procesamiento concurrente
+        batch_size = 50
+        completed = 0
+        
+        for batch_start in range(0, len(versions_to_check), batch_size):
+            batch = versions_to_check[batch_start:batch_start + batch_size]
+            
+            # Verificar versión más alta primero (más probable)
+            batch.reverse()
+            
+            # Crear tareas para este lote
+            tasks = []
+            for version in batch:
+                if found_version is None:  # Solo continuar si no hemos encontrado
+                    task = asyncio.create_task(check_version_fast(package_name, version))
+                    tasks.append((version, task))
+            
+            # Ejecutar concurrentemente
+            for version, task in tasks:
+                if found_version is not None:
+                    task.cancel()
+                    continue
+                    
+                try:
+                    exists = await asyncio.wait_for(task, timeout=3)
+                    if exists:
+                        found_version = version
+                        logger.info(f"✅ Versión encontrada: {version}")
+                        
+                        # Cancelar todas las demás tareas
+                        for v, t in tasks:
+                            if v != version:
+                                t.cancel()
+                        break
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug(f"Error checking version {version}: {e}")
+            
+            completed += len(batch)
+            progress = (completed / total_versions) * 100
+            
+            # Actualizar progreso
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    text=f"🔍 *Escaneando versiones...*\n\n"
+                         f"📊 *Rango:* {start} - {end}\n"
+                         f"📦 *Paquete:* `{package_name}`\n"
+                         f"✅ *Completado:* {progress:.1f}%\n"
+                         f"🔢 *Verificadas:* {completed}/{total_versions}\n"
+                         f"{'🎯 *Versión encontrada!*' if found_version else ''}",
+                    parse_mode='Markdown',
+                    reply_markup=get_cancel_keyboard()
+                )
+                
+                # Si encontramos versión, detener
+                if found_version is not None:
+                    processing_users[user_id]['found'] = found_version
+                    processing_users[user_id]['status'] = 'found'
+                    
+                    # Pequeña pausa para mostrar resultado
+                    await asyncio.sleep(1)
+                    
+                    # Iniciar descarga automáticamente
+                    await start_download_after_scan(user_id, found_version, message_id)
+                    return
+                    
+            except Exception as e:
+                logger.error(f"Error updating progress: {e}")
+        
+        # Si llegamos aquí y no encontramos
+        if found_version is None:
+            await telegram_app.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=f"❌ *No se encontró ninguna versión*\n\n"
+                     f"📦 *Paquete:* `{package_name}`\n"
+                     f"📊 *Rango escaneado:* {start} - {end}\n\n"
+                     f"⚠️ *Posibles causas:*\n"
+                     f"• El paquete no existe\n"
+                     f"• Las versiones están fuera del rango\n"
+                     f"• Intenta con otro rango de dígitos",
+                parse_mode='Markdown'
+            )
+            processing_users.pop(user_id, None)
+            user_sessions.pop(user_id, None)
+            
+    except asyncio.CancelledError:
+        logger.info(f"Escaneo cancelado para usuario {user_id}")
+    except Exception as e:
+        logger.error(f"Error en escaneo: {e}")
+        try:
+            await telegram_app.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=f"❌ *Error en el escaneo*\n\n`{str(e)[:100]}`",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
+    finally:
+        active_scans.pop(user_id, None)
+
+async def start_download_after_scan(user_id: int, version: int, message_id: int):
+    """Inicia descarga después de encontrar versión"""
+    if user_id not in user_sessions:
+        return
+    
+    apk_url = user_sessions[user_id]['apk_url']
+    
+    try:
+        # Actualizar mensaje
+        await telegram_app.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=message_id,
+            text=f"✅ *Versión encontrada: {version}*\n\n"
+                 f"⬇️ *Iniciando descarga...*",
+            parse_mode='Markdown'
+        )
+        
+        # Crear contexto artificial para la descarga
+        class FakeUpdate:
+            def __init__(self, user_id):
+                self.effective_user = type('obj', (object,), {'id': user_id})()
+                self.effective_chat = type('obj', (object,), {'id': user_id})()
+                self.message = type('obj', (object,), {
+                    'message_id': message_id,
+                    'reply_text': self.reply_text
+                })()
+            
+            async def reply_text(self, text, **kwargs):
+                await telegram_app.bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    **kwargs
+                )
+        
+        fake_update = FakeUpdate(user_id)
+        
+        # Ejecutar descarga
+        await download_and_send_apk(fake_update, telegram_app, apk_url, str(version))
+        
+    except Exception as e:
+        logger.error(f"Error iniciando descarga: {e}")
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ *Error en la descarga:*\n`{str(e)[:200]}`",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
+    finally:
+        # Limpiar
+        processing_users.pop(user_id, None)
+        user_sessions.pop(user_id, None)
+
+# ========== INICIALIZACIÓN ==========
 async def init_telethon():
-    """Inicializa cliente Telethon para archivos grandes"""
+    """Inicializa cliente Telethon"""
     global telethon_client
     
     if API_ID and API_HASH:
@@ -66,17 +400,17 @@ async def init_telethon():
                 API_HASH
             )
             await telethon_client.start()
-            logger.info("✅ Cliente Telethon iniciado para descargas grandes")
+            logger.info("✅ Cliente Telethon iniciado")
         except Exception as e:
             logger.error(f"❌ Error iniciando Telethon: {e}")
             telethon_client = None
 
-# ========== INICIALIZAR SESIÓN HTTP ==========
 async def init_http_session():
-    """Inicializa sesión HTTP compartida"""
+    """Inicializa sesión HTTP"""
     global http_session
-    timeout = aiohttp.ClientTimeout(total=SCAN_TIMEOUT)
-    http_session = aiohttp.ClientSession(timeout=timeout)
+    connector = aiohttp.TCPConnector(limit=MAX_WORKERS, force_close=True)
+    timeout = aiohttp.ClientTimeout(total=SCAN_TIMEOUT, connect=3, sock_read=3)
+    http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     logger.info("✅ Sesión HTTP inicializada")
 
 async def close_http_session():
@@ -85,109 +419,6 @@ async def close_http_session():
     if http_session:
         await http_session.close()
         logger.info("✅ Sesión HTTP cerrada")
-
-# ========== DETECCIÓN AUTOMÁTICA DE VERSIÓN ==========
-async def check_version_exists(package_name: str, version: int) -> bool:
-    """Verifica si una versión específica existe"""
-    url = f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apk?download_id={FIXED_DOWNLOAD_ID}"
-    
-    try:
-        async with http_session.head(url, allow_redirects=True) as response:
-            # Verificar códigos de estado exitosos
-            if response.status == 200:
-                # Verificar que el Content-Type sea de un APK
-                content_type = response.headers.get('Content-Type', '').lower()
-                content_length = response.headers.get('Content-Length', '0')
-                
-                # Algunos servidores pueden devolver 200 incluso para errores,
-                # así que verificamos también el tamaño
-                if (content_type in ['application/vnd.android.package-archive', 
-                                     'application/octet-stream'] and
-                    int(content_length) > 1024):  # Al menos 1KB
-                    return True
-                elif int(content_length) > 1024 * 10:  # Si es >10KB probablemente es válido
-                    return True
-            return False
-    except Exception as e:
-        logger.debug(f"Error verificando versión {version}: {e}")
-        return False
-
-async def find_latest_version(package_name: str) -> Optional[int]:
-    """
-    Busca la última versión disponible usando búsqueda binaria
-    y detección inteligente
-    """
-    logger.info(f"🔍 Buscando última versión para {package_name}")
-    
-    # Primero probar algunas versiones comunes rápidamente
-    quick_checks = [65535, 50000, 32768, 10000, 5000, 1000, 500, 100]
-    
-    for version in quick_checks:
-        if await check_version_exists(package_name, version):
-            logger.info(f"✅ Versión rápida encontrada: {version}")
-            # Hacer búsqueda lineal hacia arriba desde esta versión
-            return await linear_search_up(package_name, version)
-    
-    # Si no encontró en las versiones rápidas, hacer búsqueda binaria completa
-    return await binary_search_version(package_name, VERSION_MIN, VERSION_MAX)
-
-async def linear_search_up(package_name: str, start_version: int) -> Optional[int]:
-    """Búsqueda lineal hacia arriba desde una versión inicial"""
-    current_version = start_version
-    found_version = start_version
-    
-    while current_version <= VERSION_MAX:
-        if await check_version_exists(package_name, current_version):
-            found_version = current_version
-            current_version += 1
-        else:
-            break
-    
-    logger.info(f"📈 Última versión encontrada: {found_version}")
-    return found_version
-
-async def binary_search_version(package_name: str, low: int, high: int) -> Optional[int]:
-    """Búsqueda binaria para encontrar la última versión válida"""
-    last_valid = None
-    low, high = VERSION_MIN, VERSION_MAX
-    
-    while low <= high:
-        mid = (low + high) // 2
-        
-        if await check_version_exists(package_name, mid):
-            last_valid = mid
-            low = mid + 1  # Buscar en la mitad superior
-        else:
-            high = mid - 1  # Buscar en la mitad inferior
-    
-    return last_valid
-
-async def detect_version_range(package_name: str) -> tuple:
-    """
-    Detecta el rango de versiones disponibles
-    Retorna: (versión_mínima, versión_máxima)
-    """
-    # Buscar la última versión primero
-    latest = await find_latest_version(package_name)
-    
-    if latest is None:
-        return (None, None)
-    
-    # Buscar la primera versión (aproximada)
-    first_version = await find_first_version(package_name, latest)
-    
-    return (first_version, latest)
-
-async def find_first_version(package_name: str, latest_version: int) -> int:
-    """Encuentra la primera versión disponible"""
-    # Empezar desde atrás para evitar muchas peticiones
-    min_check = max(1, latest_version - 1000)
-    
-    for version in range(min_check, 0, -1):
-        if not await check_version_exists(package_name, version):
-            return version + 1 if version + 1 <= latest_version else latest_version
-    
-    return 1
 
 # ========== COMANDOS DEL BOT ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,15 +430,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🤖 *Bot de APKs APKLis 2026*\n\n"
             "📲 *Cómo usar:*\n"
             "1. Envía enlace APKLis.cu\n"
-            "2. El bot detectará automáticamente la última versión\n"
-            "3. Recibe el APK\n\n"
-            "⚡ *Detección automática de versión*\n"
-            "🔄 *Escaneo inteligente: 1-65535*\n"
-            "🛡 *Cifrado de extremo a extremo*\n\n"
-            "🛠 *Comandos Admin:*\n"
-            "• /add id1 id2 - Añadir usuarios\n"
-            "• /remove id - Eliminar usuario\n"
-            "• /users - Listar usuarios\n"
+            "2. Selecciona rango de dígitos\n"
+            "3. El bot escanea y descarga automáticamente\n\n"
+            "⚡ *Escaneo por dígitos:*\n"
+            "• 1 dígito: 1-9\n"
+            "• 2 dígitos: 10-99\n"
+            "• 3 dígitos: 100-999\n"
+            "• 4 dígitos: 1000-9999\n"
+            "• 5 dígitos: 10000-50000\n\n"
+            "🛠 *Comandos:*\n"
+            "• /cancel - Cancela operación actual\n"
             "• /status - Estado del bot"
         )
         await update.message.reply_text(welcome_msg, parse_mode='Markdown')
@@ -218,101 +450,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /cancel"""
+    user_id = update.effective_user.id
+    
+    # Cancelar escaneo activo
+    if user_id in active_scans:
+        try:
+            active_scans[user_id].cancel()
+            await update.message.reply_text("✅ Escaneo cancelado")
+        except:
+            pass
+        finally:
+            active_scans.pop(user_id, None)
+    
+    # Limpiar estados
+    processing_users.pop(user_id, None)
+    user_sessions.pop(user_id, None)
+    
+    await update.message.reply_text("✅ Todas las operaciones canceladas")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /status"""
     user_id = update.effective_user.id
     if user_id not in authorized_users:
         return
     
+    active_scans_count = len([t for t in active_scans.values() if not t.done()])
+    
     status_msg = (
-        f"📊 *Estado del Bot - {datetime.now().year}*\n\n"
+        f"📊 *Estado del Bot*\n\n"
         f"✅ Bot: Operativo\n"
         f"👥 Usuarios: {len(authorized_users)}\n"
-        f"⏬ Descargas activas: {len(processing_users)}\n"
+        f"🔍 Escaneos activos: {active_scans_count}\n"
+        f"📦 Descargas: {len([u for u in processing_users.values() if u.get('status') == 'downloading'])}\n"
         f"💾 Telethon: {'✅' if telethon_client else '❌'}\n"
-        f"🌐 HTTP Session: {'✅' if http_session else '❌'}\n"
-        f"📦 Memoria: {len(user_sessions)} sesiones\n"
-        f"🎯 Detección: {VERSION_MIN}-{VERSION_MAX}"
+        f"🎯 Límite versión: {VERSION_MAX}"
     )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
-
-async def add_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /add"""
-    user_id = update.effective_user.id
-    if user_id != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Solo administrador")
-        return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "📝 *Uso:* `/add id1 id2 id3`\n\n"
-            "Ejemplo: `/add 123456789 987654321`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    added = []
-    for arg in context.args:
-        if arg.isdigit():
-            user_id_int = int(arg)
-            if user_id_int not in authorized_users:
-                authorized_users.add(user_id_int)
-                added.append(str(user_id_int))
-    
-    if added:
-        await update.message.reply_text(
-            f"✅ *Usuarios añadidos:* {', '.join(added)}\n"
-            f"Total: {len(authorized_users)} usuarios",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text("ℹ️ No se añadieron nuevos usuarios")
-
-async def remove_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /remove"""
-    user_id = update.effective_user.id
-    if user_id != ADMIN_USER_ID:
-        return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "📝 *Uso:* `/remove id1 id2`\n\n"
-            "Ejemplo: `/remove 123456789`",
-            parse_mode='Markdown'
-        )
-        return
-    
-    removed = []
-    for arg in context.args:
-        if arg.isdigit():
-            user_id_int = int(arg)
-            if user_id_int in authorized_users and user_id_int != ADMIN_USER_ID:
-                authorized_users.remove(user_id_int)
-                # Limpiar sesión del usuario
-                if user_id_int in user_sessions:
-                    del user_sessions[user_id_int]
-                removed.append(str(user_id_int))
-    
-    if removed:
-        await update.message.reply_text(f"❌ *Eliminados:* {', '.join(removed)}")
-    else:
-        await update.message.reply_text("ℹ️ No se eliminó ningún usuario")
-
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /users"""
-    user_id = update.effective_user.id
-    if user_id != ADMIN_USER_ID:
-        return
-    
-    if not authorized_users:
-        await update.message.reply_text("📭 No hay usuarios autorizados")
-        return
-    
-    users_list = "\n".join([f"• `{uid}`" + (" 👑" if uid == ADMIN_USER_ID else "") for uid in authorized_users])
-    await update.message.reply_text(
-        f"👥 *Usuarios autorizados ({len(authorized_users)}):*\n\n{users_list}",
-        parse_mode='Markdown'
-    )
 
 # ========== MANEJO DE MENSAJES ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,7 +501,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Verificar si ya está procesando
     if user_id in processing_users:
-        await update.message.reply_text("⏳ Tienes una descarga en curso. Espera...")
+        await update.message.reply_text(
+            "⏳ Ya tienes una operación en curso.\n"
+            "Usa /cancel para detenerla.",
+            reply_markup=get_cancel_keyboard()
+        )
         return
     
     text = update.message.text.strip()
@@ -338,141 +517,142 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if match:
         package_name = match.group(1)
         
-        # Guardar URL en sesión del usuario
+        # Guardar URL en sesión
         user_sessions[user_id] = {
             'apk_url': match.group(0),
             'package_name': package_name
         }
         
-        # Opciones para el usuario
+        # Mostrar opciones
         await update.message.reply_text(
-            "✅ *Enlace detectado*\n\n"
-            "🎯 *Opciones:*\n"
-            "• Envía `/auto` para detección automática\n"
-            "• Envía el número de versión manualmente\n\n"
-            "⚡ *Detección automática:* Escanea versiones 1-65535",
-            parse_mode='Markdown'
+            f"✅ *Enlace detectado:*\n`{package_name}`\n\n"
+            f"🎯 *Selecciona una opción:*",
+            parse_mode='Markdown',
+            reply_markup=get_version_options_keyboard()
         )
-    elif user_id in user_sessions and 'apk_url' in user_sessions[user_id]:
-        package_name = user_sessions[user_id]['package_name']
-        apk_url = user_sessions[user_id]['apk_url']
         
-        # Comando /auto o cualquier texto que no sea número
-        if text.lower() == '/auto' or not text.isdigit():
-            # Iniciar detección automática
-            processing_users.add(user_id)
-            status_msg = await update.message.reply_text(
-                "🔍 *Iniciando detección automática...*\n"
-                "_Escaneando versiones 1-65535_\n"
-                "⏱ Esto puede tomar unos segundos",
-                parse_mode='Markdown'
-            )
+    elif user_id in user_sessions and 'apk_url' in user_sessions[user_id]:
+        # Si el usuario ingresa un número manualmente
+        if text.isdigit():
+            version = int(text)
+            
+            # Validar rango
+            if version < 1 or version > VERSION_MAX:
+                await update.message.reply_text(
+                    f"❌ *Versión fuera de rango*\n\n"
+                    f"Rango permitido: 1 - {VERSION_MAX}\n"
+                    f"Ingresa una versión válida:",
+                    parse_mode='Markdown',
+                    reply_markup=get_cancel_keyboard()
+                )
+                return
+            
+            apk_url = user_sessions[user_id]['apk_url']
+            
+            # Marcar como procesando
+            processing_users[user_id] = {'status': 'downloading'}
             
             try:
-                # Buscar última versión
-                latest_version = await find_latest_version(package_name)
-                
-                if latest_version is None:
-                    await status_msg.edit_text(
-                        "❌ *No se encontró ninguna versión disponible*\n\n"
-                        "Verifica que:\n"
-                        "• El enlace sea correcto\n"
-                        "• La aplicación exista en el repositorio\n"
-                        "• Intenta con una versión manual: `/version número`",
-                        parse_mode='Markdown'
-                    )
-                    processing_users.discard(user_id)
-                    return
-                
-                # Eliminar sesión
-                del user_sessions[user_id]
-                
-                # Iniciar descarga automáticamente
-                await status_msg.edit_text(
-                    f"✅ *Versión encontrada: {latest_version}*\n"
-                    f"⬇️ *Iniciando descarga...*",
-                    parse_mode='Markdown'
+                # Verificar si existe primero
+                await update.message.reply_text(
+                    f"🔍 *Verificando versión {version}...*",
+                    parse_mode='Markdown',
+                    reply_markup=get_cancel_keyboard()
                 )
                 
-                await download_and_send_apk(update, context, apk_url, str(latest_version))
-                
-            except Exception as e:
-                logger.error(f"Error en detección automática: {e}")
-                await status_msg.edit_text(f"❌ Error en detección: {str(e)[:200]}")
-                processing_users.discard(user_id)
-            finally:
-                if user_id in user_sessions:
-                    del user_sessions[user_id]
-                
-        elif text.isdigit():
-            # Procesar versión manual
-            version = text
-            del user_sessions[user_id]
-            
-            # Iniciar descarga
-            processing_users.add(user_id)
-            try:
-                await download_and_send_apk(update, context, apk_url, version)
+                if await check_version_fast(user_sessions[user_id]['package_name'], version):
+                    # Iniciar descarga
+                    await download_and_send_apk(update, context, apk_url, str(version))
+                else:
+                    await update.message.reply_text(
+                        f"❌ *Versión {version} no encontrada*\n\n"
+                        f"La versión especificada no existe.\n"
+                        f"Prueba con detección automática.",
+                        parse_mode='Markdown'
+                    )
+                    
             except Exception as e:
                 logger.error(f"Error en descarga manual: {e}")
                 await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
             finally:
-                processing_users.discard(user_id)
+                # Limpiar
+                processing_users.pop(user_id, None)
+                user_sessions.pop(user_id, None)
+        else:
+            await update.message.reply_text(
+                "📝 *Envía:*\n"
+                "1. Un enlace de APKLis.cu\n"
+                "O después del enlace:\n"
+                "2. Un número de versión",
+                parse_mode='Markdown'
+            )
     else:
         await update.message.reply_text(
             "📝 *Envía un enlace de APKLis.cu*\n\n"
-            "Ejemplo: `https://apklis.cu/application/com.example.app`\n\n"
-            "Luego elige:\n"
-            "• `/auto` para detección automática\n"
-            "• Número de versión específica",
+            "Ejemplo: `https://apklis.cu/application/com.example.app`",
             parse_mode='Markdown'
         )
 
-# ========== DESCARGA Y ENVÍO DE APKs ==========
-async def download_large_file(url: str, filepath: str, update: Update = None, status_msg = None):
-    """Descarga archivos grandes usando aiohttp con progreso"""
-    timeout = aiohttp.ClientTimeout(total=300)  # 5 minutos
-    
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                total_size = int(response.headers.get('content-length', 0))
-                
-                with open(filepath, 'wb') as f:
-                    downloaded = 0
-                    last_update = 0
+# ========== DESCARGA RÁPIDA ==========
+async def download_with_progress(url: str, filepath: str, update: Update, status_msg):
+    """Descarga con progreso optimizado"""
+    try:
+        timeout = aiohttp.ClientTimeout(total=300, connect=10, sock_read=30)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    total_size = int(response.headers.get('content-length', 0))
                     
-                    async for chunk in response.content.iter_chunked(8192 * 8):  # 64KB chunks
-                        f.write(chunk)
-                        downloaded += len(chunk)
+                    with open(filepath, 'wb') as f:
+                        downloaded = 0
+                        chunk_size = 1024 * 64  # 64KB chunks
+                        last_update = 0
                         
-                        # Actualizar progreso cada 5MB o 5%
-                        if total_size > 0 and status_msg:
-                            percent = (downloaded / total_size) * 100
-                            current_time = asyncio.get_event_loop().time()
+                        async for chunk in response.content.iter_chunked(chunk_size):
+                            if downloaded == 0:
+                                await status_msg.edit_text("📥 *Descargando...*", parse_mode='Markdown')
                             
-                            # Actualizar cada 5% o cada 5 segundos
-                            if (percent - last_update >= 5 or 
-                                current_time - last_update >= 5):
-                                if total_size > 10 * 1024 * 1024:  # >10MB
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            # Actualizar progreso solo para archivos grandes y no tan frecuente
+                            if total_size > 50 * 1024 * 1024:  # >50MB
+                                percent = (downloaded / total_size) * 100
+                                current_time = time.time()
+                                
+                                # Actualizar máximo cada 10% o 5 segundos
+                                if percent - last_update >= 10 or current_time - last_update >= 5:
                                     try:
                                         await status_msg.edit_text(
                                             f"📥 *Descargando...*\n"
-                                            f"📊 {percent:.1f}% ({downloaded/1024/1024:.1f}MB/{total_size/1024/1024:.1f}MB)",
+                                            f"📊 {percent:.0f}% ({downloaded/1024/1024:.1f}MB/{total_size/1024/1024:.1f}MB)",
                                             parse_mode='Markdown'
                                         )
+                                        last_update = percent
                                     except:
                                         pass
-                                last_update = percent
-                
-                return True
-            else:
-                logger.error(f"HTTP Error {response.status}")
-                return False
+                    
+                    return True
+                else:
+                    logger.error(f"HTTP Error {response.status}")
+                    return False
+    except Exception as e:
+        logger.error(f"Error en descarga: {e}")
+        return False
 
-async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TYPE, apk_url: str, version: str):
-    """Descarga y envía el APK (soporta hasta 2GB)"""
-    status_msg = await update.message.reply_text(f"🔄 *Preparando versión {version}...*", parse_mode='Markdown')
+async def download_and_send_apk(update: Update, context, apk_url: str, version: str):
+    """Descarga y envía el APK optimizado"""
+    user_id = update.effective_user.id
+    
+    if user_id in processing_users and processing_users[user_id].get('status') == 'cancelled':
+        return
+    
+    status_msg = await update.message.reply_text(
+        f"🔄 *Preparando versión {version}...*",
+        parse_mode='Markdown',
+        reply_markup=get_cancel_keyboard()
+    )
     
     try:
         # Extraer información
@@ -481,167 +661,122 @@ async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TY
         # Generar URL de descarga
         download_url = f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apk?download_id={FIXED_DOWNLOAD_ID}"
         
-        # Verificar que la versión existe antes de descargar
-        await status_msg.edit_text("🔍 *Verificando versión...*", parse_mode='Markdown')
-        
-        if not await check_version_exists(package_name, int(version)):
-            await status_msg.edit_text(
-                f"❌ *Versión {version} no encontrada*\n\n"
-                f"La versión especificada no existe o no está disponible.\n"
-                f"Prueba con `/auto` para detección automática.",
-                parse_mode='Markdown'
-            )
-            return
-        
         # Nombre del archivo
         safe_filename = f"{package_name}-v{version}.apk"
         temp_path = f"temp_{hashlib.md5(safe_filename.encode()).hexdigest()[:8]}.apk"
         
-        # Paso 1: Descargar
-        await status_msg.edit_text("📥 *Descargando APK...*\n_Esto puede tomar varios minutos para archivos grandes_", parse_mode='Markdown')
+        # Descargar
+        await status_msg.edit_text("📥 *Descargando APK...*", parse_mode='Markdown')
         
-        # Usar aiohttp para descarga asíncrona
-        download_success = await download_large_file(download_url, temp_path, update, status_msg)
+        download_success = await download_with_progress(download_url, temp_path, update, status_msg)
         
         if not download_success or not os.path.exists(temp_path):
-            await status_msg.edit_text("❌ *Error en la descarga*\n\nVerifica tu conexión e intenta nuevamente", parse_mode='Markdown')
+            await status_msg.edit_text("❌ *Error en la descarga*", parse_mode='Markdown')
             return
         
-        # Verificar tamaño del archivo
+        # Verificar tamaño
         file_size = os.path.getsize(temp_path)
-        logger.info(f"Archivo descargado: {safe_filename} ({file_size/1024/1024:.2f} MB)")
         
-        # Verificar que sea un APK válido (tamaño mínimo)
-        if file_size < 1024 * 100:  # Menos de 100KB probablemente no es un APK válido
-            await status_msg.edit_text("❌ *APK inválido*\n\nEl archivo descargado es demasiado pequeño para ser un APK válido", parse_mode='Markdown')
+        if file_size < 1024 * 100:
+            await status_msg.edit_text("❌ *APK inválido*", parse_mode='Markdown')
             os.remove(temp_path)
             return
         
-        # Paso 2: Enviar
-        await status_msg.edit_text("📤 *Enviando APK...*\n_Usando protocolo seguro_", parse_mode='Markdown')
+        # Enviar
+        await status_msg.edit_text("📤 *Enviando APK...*", parse_mode='Markdown')
         
-        try:
-            # Para archivos grandes (>50MB), usar Telethon si está disponible
-            if file_size > 50 * 1024 * 1024 and telethon_client:
-                await status_msg.edit_text("⚡ *Enviando archivo grande...*", parse_mode='Markdown')
-                
-                # Enviar con Telethon
+        if file_size > 50 * 1024 * 1024 and telethon_client:
+            try:
                 await telethon_client.send_file(
-                    await telethon_client.get_input_entity(update.effective_chat.id),
+                    await telethon_client.get_input_entity(user_id),
                     temp_path,
-                    caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB\n✅ Descargado automáticamente",
+                    caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB",
                     force_document=True
                 )
-            else:
-                # Enviar con python-telegram-bot (hasta 50MB)
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Error enviando: {str(e)[:100]}", parse_mode='Markdown')
+        else:
+            try:
                 with open(temp_path, 'rb') as f:
                     await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
+                        chat_id=user_id,
                         document=f,
                         filename=safe_filename,
-                        caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB\n🎯 Detección automática",
+                        caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB",
                         parse_mode='Markdown'
                     )
-            
-            # Limpiar
-            await status_msg.delete()
-            
-        finally:
-            # Limpiar archivo temporal
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Error enviando: {str(e)[:100]}", parse_mode='Markdown')
                 
     except Exception as e:
-        logger.error(f"Error enviando APK: {e}")
+        logger.error(f"Error: {e}")
         await status_msg.edit_text(f"❌ *Error:* `{str(e)[:100]}`", parse_mode='Markdown')
     finally:
-        # Asegurarse de remover al usuario de processing_users
-        processing_users.discard(update.effective_user.id)
+        # Limpiar
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.remove(temp_path)
+        processing_users.pop(user_id, None)
+        user_sessions.pop(user_id, None)
 
-# ========== SERVIDOR WEB PARA RENDER ==========
+# ========== SERVIDOR WEB ==========
 async def health_check(request):
-    """Endpoint de salud para Render"""
     return web.json_response({
         "status": "healthy",
-        "year": 2026,
-        "service": "APKLis Downloader Bot",
-        "version_detection": f"{VERSION_MIN}-{VERSION_MAX}",
-        "users_count": len(authorized_users),
-        "active_downloads": len(processing_users),
-        "telethon_available": telethon_client is not None,
-        "http_session": http_session is not None,
-        "timestamp": datetime.now().isoformat()
+        "version_max": VERSION_MAX,
+        "active_scans": len(active_scans),
+        "active_downloads": len([u for u in processing_users.values() if u.get('status') == 'downloading'])
     })
 
 async def start_web_server():
-    """Inicia el servidor web para Render"""
     app = web.Application()
-    
-    # Endpoints
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
-    app.router.add_get('/status', health_check)
     
-    # Configurar el runner
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Iniciar en el puerto especificado
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    logger.info(f"🌐 Servidor web iniciado en puerto {PORT}")
-    logger.info(f"📅 Año: {datetime.now().year}")
-    logger.info(f"🎯 Detección de versión: {VERSION_MIN}-{VERSION_MAX}")
-    logger.info(f"🤖 Bot listo para recibir comandos")
-    
+    logger.info(f"🌐 Servidor web en puerto {PORT}")
     return runner
 
-# ========== INICIALIZACIÓN Y EJECUCIÓN ==========
+# ========== MAIN ==========
 async def main():
-    """Función principal asíncrona"""
     global telegram_app
     
-    logger.info("🚀 Iniciando APKLis Bot 2026 con detección automática...")
+    logger.info("🚀 Iniciando bot con escaneo por dígitos...")
     
-    # 1. Inicializar sesión HTTP
+    # Inicializar
     await init_http_session()
-    
-    # 2. Inicializar Telethon para archivos grandes
     await init_telethon()
     
-    # 3. Crear aplicación de Telegram
+    # Crear app de Telegram
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     
-    # 4. Registrar handlers
+    # Handlers
     telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("status", status))
-    telegram_app.add_handler(CommandHandler("add", add_users))
-    telegram_app.add_handler(CommandHandler("remove", remove_users))
-    telegram_app.add_handler(CommandHandler("users", list_users))
-    telegram_app.add_handler(CommandHandler("auto", handle_message))  # Para /auto
+    telegram_app.add_handler(CommandHandler("cancel", cancel_command))
+    telegram_app.add_handler(CommandHandler("status", status_command))
+    telegram_app.add_handler(CallbackQueryHandler(handle_callback))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # 5. Inicializar bot
+    # Iniciar bot
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+    await telegram_app.updater.start_polling(drop_pending_updates=True)
     
-    logger.info("✅ Bot de Telegram iniciado")
+    logger.info("✅ Bot iniciado")
     
-    # 6. Iniciar servidor web (para Render)
+    # Servidor web
     web_runner = await start_web_server()
     
-    # 7. Mantener corriendo
     try:
-        await asyncio.Future()  # Ejecutar indefinidamente
+        await asyncio.Future()
     except asyncio.CancelledError:
-        logger.info("👋 Apagando bot...")
-        
-        # Apagar limpiamente
+        logger.info("👋 Apagando...")
+    finally:
         await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
@@ -653,21 +788,17 @@ async def main():
         await web_runner.cleanup()
 
 def run():
-    """Punto de entrada para Render"""
-    # Configurar asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
-        # Ejecutar bot indefinidamente
         loop.run_until_complete(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Bot detenido por usuario")
+        logger.info("🛑 Detenido por usuario")
     except Exception as e:
         logger.error(f"❌ Error crítico: {e}")
     finally:
         loop.close()
-        logger.info("👋 Bot finalizado")
 
 if __name__ == '__main__':
     run()
