@@ -2,12 +2,13 @@ import os
 import re
 import asyncio
 import logging
-from typing import Dict, Set, Tuple, Optional
+from typing import Dict, Set
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from aiohttp import web, ClientSession, ClientTimeout, ClientError
+from aiohttp import web
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 import hashlib
 
 # Configurar logging
@@ -240,130 +241,65 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-# ========== FUNCIONES DE DESCARGA MEJORADAS ==========
-async def try_download_with_fallback(urls: list, temp_path: str, status_msg, update: Update) -> Tuple[bool, str, int]:
-    """Intenta descargar desde múltiples URLs con fallback"""
-    timeout = ClientTimeout(total=300)  # 5 minutos
-    downloaded = False
-    final_url = ""
-    file_size = 0
+# ========== DESCARGA Y ENVÍO DE APKs ==========
+async def download_large_file(url: str, filepath: str):
+    """Descarga archivos grandes usando aiohttp"""
+    import aiohttp
     
-    async with ClientSession(timeout=timeout) as session:
-        for i, url in enumerate(urls):
-            try:
-                logger.info(f"Intentando descargar desde: {url}")
+    timeout = aiohttp.ClientTimeout(total=300)  # 5 minutos
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                total_size = int(response.headers.get('content-length', 0))
                 
-                # Actualizar estado
-                if i > 0:
-                    await status_msg.edit_text(
-                        f"🔄 *Intento {i+1}/{len(urls)}*\n"
-                        f"Probando con extensión alternativa...",
-                        parse_mode='Markdown'
-                    )
+                with open(filepath, 'wb') as f:
+                    downloaded = 0
+                    async for chunk in response.content.iter_chunked(8192 * 8):  # 64KB chunks
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Log progreso para archivos grandes
+                        if total_size > 10 * 1024 * 1024:  # >10MB
+                            percent = (downloaded / total_size) * 100
+                            if int(percent) % 10 == 0:
+                                logger.info(f"Descarga: {percent:.1f}% ({downloaded/1024/1024:.1f}MB/{total_size/1024/1024:.1f}MB)")
                 
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        total_size = int(response.headers.get('content-length', 0))
-                        
-                        with open(temp_path, 'wb') as f:
-                            downloaded_size = 0
-                            async for chunk in response.content.iter_chunked(8192 * 8):  # 64KB chunks
-                                f.write(chunk)
-                                downloaded_size += len(chunk)
-                                
-                                # Log progreso para archivos grandes
-                                if total_size > 10 * 1024 * 1024:  # >10MB
-                                    percent = (downloaded_size / total_size) * 100
-                                    if int(percent) % 10 == 0:
-                                        logger.info(f"Descarga: {percent:.1f}% ({downloaded_size/1024/1024:.1f}MB/{total_size/1024/1024:.1f}MB)")
-                                        await status_msg.edit_text(
-                                            f"📥 *Descargando...*\n"
-                                            f"Progreso: {percent:.1f}%\n"
-                                            f"Tamaño: {total_size/1024/1024:.1f} MB\n"
-                                            f"URL: {i+1}/{len(urls)}",
-                                            parse_mode='Markdown'
-                                        )
-                        
-                        file_size = os.path.getsize(temp_path)
-                        if file_size > 0:
-                            downloaded = True
-                            final_url = url
-                            logger.info(f"✅ Descarga exitosa desde: {url} ({file_size/1024/1024:.2f} MB)")
-                            break
-                        
-            except ClientError as e:
-                logger.warning(f"Error con URL {url}: {e}")
-                continue
-            except Exception as e:
-                logger.error(f"Error inesperado: {e}")
-                continue
-    
-    return downloaded, final_url, file_size
+                return True
+            else:
+                logger.error(f"HTTP Error {response.status}")
+                return False
 
 async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TYPE, apk_url: str, version: str):
-    """Descarga y envía el APK con fallback a .apklis"""
-    status_msg = await update.message.reply_text("🔄 *Preparando descarga...*", parse_mode='Markdown')
+    """Descarga y envía el APK (soporta hasta 2GB)"""
+    status_msg = await update.message.reply_text("🔄 *Iniciando descarga...*", parse_mode='Markdown')
     
     try:
         # Extraer información
         package_name = apk_url.split('/')[-1]
         
-        # Generar URLs alternativas (primero .apk, luego .apklis)
-        urls_to_try = [
-            f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apk?download_id={FIXED_DOWNLOAD_ID}",
-            f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apklis?download_id={FIXED_DOWNLOAD_ID}"
-        ]
+        # Generar URL de descarga
+        download_url = f"https://archive.apklis.cu/application/apk/{package_name}-v{version}.apk?download_id={FIXED_DOWNLOAD_ID}"
         
-        # Nombre del archivo (mantiene extensión original del enlace exitoso)
-        safe_filename_base = f"{package_name}-v{version}"
-        temp_path = f"temp_{hashlib.md5(safe_filename_base.encode()).hexdigest()[:8]}"
+        # Nombre del archivo
+        safe_filename = f"{package_name}-v{version}.apk"
+        temp_path = f"temp_{hashlib.md5(safe_filename.encode()).hexdigest()[:8]}.apk"
         
-        # Paso 1: Intentar descarga con fallback
-        await status_msg.edit_text(
-            "📥 *Buscando archivo disponible...*\n"
-            "Intentando con extensión .apk",
-            parse_mode='Markdown'
-        )
+        # Paso 1: Descargar
+        await status_msg.edit_text("📥 *Descargando APK...*\n_Esto puede tomar varios minutos para archivos grandes_", parse_mode='Markdown')
         
-        # Intentar descargar desde las URLs
-        downloaded, final_url, file_size = await try_download_with_fallback(urls_to_try, temp_path, status_msg, update)
+        # Usar aiohttp para descarga asíncrona
+        download_success = await download_large_file(download_url, temp_path)
         
-        if not downloaded:
-            await status_msg.edit_text(
-                "❌ *Error en la descarga*\n\n"
-                "No se pudo descargar el archivo con ninguna extensión.\n"
-                "Verifica:\n"
-                "• Que la versión sea correcta\n"
-                "• Que la aplicación exista\n"
-                "• Tu conexión a internet",
-                parse_mode='Markdown'
-            )
+        if not download_success or not os.path.exists(temp_path):
+            await status_msg.edit_text("❌ *Error en la descarga*\n\nVerifica:\n• Que la versión sea correcta\n• Que la aplicación exista", parse_mode='Markdown')
             return
         
-        # Determinar extensión basada en la URL exitosa
-        if '.apklis' in final_url:
-            file_extension = '.apklis'
-            temp_path_with_ext = f"{temp_path}.apklis"
-            os.rename(temp_path, temp_path_with_ext)
-            temp_path = temp_path_with_ext
-            final_filename = f"{safe_filename_base}.apklis"
-        else:
-            file_extension = '.apk'
-            temp_path_with_ext = f"{temp_path}.apk"
-            os.rename(temp_path, temp_path_with_ext)
-            temp_path = temp_path_with_ext
-            final_filename = f"{safe_filename_base}.apk"
+        # Verificar tamaño del archivo
+        file_size = os.path.getsize(temp_path)
+        logger.info(f"Archivo descargado: {safe_filename} ({file_size/1024/1024:.2f} MB)")
         
-        logger.info(f"Archivo descargado: {final_filename} ({file_size/1024/1024:.2f} MB) desde {final_url}")
-        
-        # Paso 2: Enviar archivo
-        await status_msg.edit_text(
-            f"📤 *Enviando archivo...*\n"
-            f"Tamaño: {file_size/1024/1024:.1f} MB\n"
-            f"Extensión: {file_extension}\n"
-            f"_Usando protocolo seguro_",
-            parse_mode='Markdown'
-        )
+        # Paso 2: Enviar
+        await status_msg.edit_text("📤 *Enviando APK...*\n_Usando protocolo seguro_", parse_mode='Markdown')
         
         try:
             # Para archivos grandes (>50MB), usar Telethon si está disponible
@@ -374,13 +310,7 @@ async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TY
                 await telethon_client.send_file(
                     await telethon_client.get_input_entity(update.effective_chat.id),
                     temp_path,
-                    caption=(
-                        f"📦 *{package_name}*\n"
-                        f"🔢 Versión: {version}\n"
-                        f"💾 Tamaño: {file_size/1024/1024:.1f}MB\n"
-                        f"📎 Extensión: {file_extension}\n"
-                        f"✅ Descargado con éxito"
-                    ),
+                    caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB\n✅ Descargado con éxito",
                     force_document=True
                 )
             else:
@@ -389,13 +319,8 @@ async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TY
                     await context.bot.send_document(
                         chat_id=update.effective_chat.id,
                         document=f,
-                        filename=final_filename,
-                        caption=(
-                            f"📦 *{package_name}*\n"
-                            f"🔢 Versión: {version}\n"
-                            f"💾 Tamaño: {file_size/1024/1024:.1f}MB\n"
-                            f"📎 Extensión: {file_extension}"
-                        ),
+                        filename=safe_filename,
+                        caption=f"📦 *{package_name}*\n🔢 Versión: {version}\n💾 Tamaño: {file_size/1024/1024:.1f}MB",
                         parse_mode='Markdown'
                     )
             
@@ -408,22 +333,15 @@ async def download_and_send_apk(update: Update, context: ContextTypes.DEFAULT_TY
                 os.remove(temp_path)
                 
     except Exception as e:
-        logger.error(f"Error enviando archivo: {e}")
-        await status_msg.edit_text(
-            f"❌ *Error al enviar:*\n`{str(e)[:100]}`\n\n"
-            f"El archivo se descargó pero no se pudo enviar.",
-            parse_mode='Markdown'
-        )
-        # Limpiar archivo temporal en caso de error
-        if 'temp_path' in locals() and os.path.exists(temp_path):
-            os.remove(temp_path)
+        logger.error(f"Error enviando APK: {e}")
+        await status_msg.edit_text(f"❌ *Error:* `{str(e)[:100]}`", parse_mode='Markdown')
 
 # ========== SERVIDOR WEB PARA RENDER ==========
 async def health_check(request):
     """Endpoint de salud para Render"""
     return web.json_response({
         "status": "healthy",
-        "year": datetime.now().year,
+        "year": 2026,
         "service": "APKLis Downloader Bot",
         "users_count": len(authorized_users),
         "active_downloads": len(processing_users),
